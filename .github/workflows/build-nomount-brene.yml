@@ -12,41 +12,33 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
 
-      - name: Checkout android_kernel_xiaomi_sm8850 (bakasu branch)
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget zip unzip tar xz-utils bc bison flex \
+            build-essential libssl-dev libelf-dev dwarves python3 \
+            ccache rsync jq cpio kmod cargo rustc clang lld llvm
+
+      - name: Checkout android_kernel_xiaomi_sm8850 (bakasu)
         uses: actions/checkout@v4
         with:
           ref: bakasu
           fetch-depth: 1
-          path: kernel
+          path: kernel_prep
 
-      - name: Download Toolchain and SuSFS Sources
+      - name: Clone Kokuban_Kernel_CI_Center & Inject NoMount + BRENE Flags
         run: |
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 -b master-kernel-build-2024 toolchain-clang
-          git clone --depth=1 https://android.googlesource.com/kernel/prebuilts/build-tools -b master-kernel-build-2024 toolchain-build
-          git clone --depth=1 -b gki-android16-6.12 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
-          git clone --depth=1 https://github.com/YuzakiKokuban/Kokuban_Kernel_CI_Center.git ci_patches
+          git clone --depth=1 https://github.com/YuzakiKokuban/Kokuban_Kernel_CI_Center.git ci_center
 
-      - name: Integrate BakaSU, SuSFS (10/10 BRENE features), and NoMount
-        working-directory: kernel
-        run: |
-          # 1. Ensure latest BakaSU is present (if not already pinned in tree)
-          if [ ! -d "KernelSU" ]; then
-            curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
-          fi
+          # 1. Apply the existing mi17_sm8850 SuSFS patch into our staging tree first
+          cd kernel_prep
+          patch -p1 < ../ci_center/configs/susfs/mi17_sm8850.patch
 
-          # 2. Copy SuSFS 6.12 source files and apply the mi17_sm8850 SuSFS patch
-          cp -r ../susfs4ksu/kernel_patches/fs/* fs/
-          cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
-          if [ -f "../ci_patches/configs/susfs/mi17_sm8850.patch" ]; then
-            patch -p1 < ../ci_patches/configs/susfs/mi17_sm8850.patch
-          else
-            patch -p1 < ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch
-          fi
-
-          # 3. Integrate NoMount (v2.2.0+ VFS driver) instead of Hybrid Mount
+          # 2. Run NoMount's official kernel integration script (adds fs/nomount, fs/Kconfig, fs/Makefile)
           curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash
 
-          # 4. Enable BakaSU, all 10 SuSFS flags for BRENE, and NoMount in gki_defconfig
+          # 3. Append NoMount and all 10 SuSFS flags for BRENE to gki_defconfig
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
@@ -64,24 +56,32 @@ jobs:
           CONFIG_NOMOUNT=y
           EOF
 
-      - name: Compile Kernel Image
-        working-directory: kernel
-        run: |
-          export PATH="$GITHUB_WORKSPACE/toolchain-clang/clang-r487747c/bin:$GITHUB_WORKSPACE/toolchain-build/linux-x86/bin:$PATH"
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 LOCALVERSION="-android16-Kokuban-SilverWolf" -j$(nproc) Image
+          # 4. Export the unified (SuSFS + NoMount + BRENE defconfig) patch back into CI Center
+          git add -A
+          git diff --cached > ../ci_center/configs/susfs/mi17_sm8850.patch
+          cd ..
+          rm -rf kernel_prep
 
-      - name: Package Flashable AnyKernel3 ZIP
+      - name: Build Kernel via Kokuban CI Center (SuSFS ON, Hybrid Mount OFF)
+        working-directory: ci_center
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
-          cd AnyKernel3
-          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
-          sed -i 's|block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|block=auto;|g' anykernel.sh
-          zip -r9 ../Mi17-Kokuban-BakaSU-SuSFS-NoMount.zip * -x .git README.md *placeholder
+          chmod +x ./kokuban
+          ./kokuban build mi17_sm8850 bakasu bakasu \
+            --with-susfs \
+            --no-hybridmount \
+            --local-root "$GITHUB_WORKSPACE/kokuban-work"
+
+      - name: Collect Flashable AnyKernel3 ZIP
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifact_out"
+          find "$GITHUB_WORKSPACE" -type f -name "*.zip" \
+            -not -path "*/toolchains/*" \
+            -not -path "*/toolchain/*" \
+            -exec cp -v {} "$GITHUB_WORKSPACE/artifact_out/" \;
+          ls -lh "$GITHUB_WORKSPACE/artifact_out"
 
       - name: Upload Compiled Kernel Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Mi17-Kokuban-BakaSU-SuSFS-NoMount
-          path: Mi17-Kokuban-BakaSU-SuSFS-NoMount.zip
+          path: artifact_out/*.zip
