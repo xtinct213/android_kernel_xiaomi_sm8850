@@ -17,7 +17,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git curl wget zip unzip tar xz-utils bc bison flex \
-            build-essential libssl-dev libelf-dev dwarves python3 \
+            build-essential libssl-dev libelf-dev libdw-dev dwarves python3 \
             ccache rsync jq cpio kmod cargo rustc clang lld llvm
 
       - name: Checkout android_kernel_xiaomi_sm8850 (bakasu)
