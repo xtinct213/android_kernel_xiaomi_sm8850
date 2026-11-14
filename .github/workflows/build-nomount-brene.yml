@@ -20,87 +20,38 @@ jobs:
             build-essential libssl-dev libelf-dev dwarves python3 \
             ccache rsync jq cpio kmod cargo rustc clang lld llvm
 
-      - name: Checkout android_kernel_xiaomi_sm8850 (Full History)
+      - name: Checkout android_kernel_xiaomi_sm8850 (bakasu)
         uses: actions/checkout@v4
         with:
           ref: bakasu
-          fetch-depth: 0
+          fetch-depth: 1
           path: kernel_prep
 
-      - name: Clone Kokuban_Kernel_CI_Center & Inject NoMount + BRENE Flags
+      - name: Clone Kokuban_Kernel_CI_Center & Append NoMount + BRENE Patch
         run: |
           git clone --depth=1 https://github.com/YuzakiKokuban/Kokuban_Kernel_CI_Center.git ci_center
 
           cd kernel_prep
-          git fetch origin main:refs/remotes/origin/main || true
+          # 1. Stage fs/Makefile with the SuSFS hunk applied so NoMount's Makefile hunk has exact context
+          patch -p1 --forward < ../ci_center/configs/susfs/mi17_sm8850.patch || true
+          cp fs/Makefile /tmp/Makefile.susfs
+          git reset --hard HEAD
+          git clean -fd
+          cp /tmp/Makefile.susfs fs/Makefile
+          git config user.email "builder@localhost"
+          git config user.name "Builder"
+          git commit -am "base: fs/Makefile after susfs"
 
-          # 1. Reconcile and apply mi17_sm8850.patch using exact git history blobs for conflicting hook files
-          python3 - << 'PYEOF'
-          import re, subprocess, os
-
-          with open("../ci_center/configs/susfs/mi17_sm8850.patch", "r", encoding="utf-8", errors="replace") as f:
-              patch_text = f.read()
-
-          file_diffs = re.split(r'(?=^diff --git )', patch_text, flags=re.MULTILINE)
-
-          for d in file_diffs:
-              if not d.strip():
-                  continue
-              m_file = re.search(r'^diff --git a/(.*?) b/(.*?)$', d, re.MULTILINE)
-              if not m_file:
-                  continue
-              filepath = m_file.group(1).strip()
-
-              # Try direct clean apply first
-              p = subprocess.run(["patch", "-p1", "--dry-run", "--forward"], input=d.encode(), capture_output=True)
-              if p.returncode == 0:
-                  subprocess.run(["patch", "-p1", "--forward"], input=d.encode(), check=True)
-                  continue
-
-              # Try exact pre-patch blob SHA from 'index <old_sha>..'
-              applied = False
-              m_idx = re.search(r'^index ([0-9a-f]+)\.\.', d, re.MULTILINE)
-              if m_idx and os.path.exists(filepath):
-                  old_sha = m_idx.group(1)
-                  if subprocess.run(["git", "cat-file", "-e", old_sha], capture_output=True).returncode == 0:
-                      blob = subprocess.check_output(["git", "cat-file", "blob", old_sha])
-                      with open(filepath, "wb") as out_f:
-                          out_f.write(blob)
-                      if subprocess.run(["patch", "-p1", "--dry-run", "--forward"], input=d.encode(), capture_output=True).returncode == 0:
-                          subprocess.run(["patch", "-p1", "--forward"], input=d.encode(), check=True)
-                          applied = True
-                          print(f"Applied {filepath} cleanly via exact blob {old_sha}")
-
-              # Search git commit history across bakasu and main for matching base file
-              if not applied and os.path.exists(filepath):
-                  revs = subprocess.check_output(["git", "rev-list", "--all", "--", filepath], text=True).splitlines()
-                  for rev in revs:
-                      blob = subprocess.check_output(["git", "show", f"{rev}:{filepath}"])
-                      with open(filepath, "wb") as out_f:
-                          out_f.write(blob)
-                      if subprocess.run(["patch", "-p1", "--dry-run", "--forward"], input=d.encode(), capture_output=True).returncode == 0:
-                          subprocess.run(["patch", "-p1", "--forward"], input=d.encode(), check=True)
-                          applied = True
-                          print(f"Applied {filepath} cleanly via historical commit {rev}")
-                          break
-
-              # Fallback: restore HEAD, apply non-conflicting hunks, and clean up .rej/.orig
-              if not applied:
-                  subprocess.run(["git", "checkout", "HEAD", "--", filepath], capture_output=True)
-                  subprocess.run(["patch", "-p1", "--forward"], input=d.encode())
-                  for ext in [".rej", ".orig"]:
-                      if os.path.exists(filepath + ext):
-                          os.remove(filepath + ext)
-                  print(f"Applied {filepath} with existing BakaSU hook preserved")
-          PYEOF
-
-          # 2. Run NoMount's official kernel integration script
+          # 2. Run NoMount setup.sh, then replace the symlink with the real C source files and remove the nested git repo
           curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash
+          rm -f fs/nomount
+          cp -r NoMount/kernel/src fs/nomount
+          rm -rf NoMount
+          echo "ccflags-y += -Wno-error" >> fs/nomount/Makefile
 
           # 3. Append NoMount and all 10 SuSFS flags for BRENE to gki_defconfig
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
           CONFIG_KSU=y
-          CONFIG_KSU_MANUAL_HOOK=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -115,10 +66,10 @@ jobs:
           CONFIG_NOMOUNT=y
           EOF
 
-          # 4. Clean any untracked .rej/.orig files and export clean patch relative to bakasu HEAD
-          find . \( -name "*.rej" -o -name "*.orig" \) -delete
+          # 4. Append (>>) our NoMount + defconfig diff to the end of the original mi17_sm8850.patch
           git add -A
-          git diff --cached HEAD > ../ci_center/configs/susfs/mi17_sm8850.patch
+          echo "" >> ../ci_center/configs/susfs/mi17_sm8850.patch
+          git diff --cached HEAD >> ../ci_center/configs/susfs/mi17_sm8850.patch
           cd ..
           rm -rf kernel_prep
 
@@ -134,9 +85,7 @@ jobs:
       - name: Collect Flashable AnyKernel3 ZIP
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifact_out"
-          find "$GITHUB_WORKSPACE" -type f -name "*.zip" \
-            -not -path "*/toolchains/*" \
-            -not -path "*/toolchain/*" \
+          find "$GITHUB_WORKSPACE/kokuban-work/artifacts" -type f -name "*.zip" \
             -exec cp -v {} "$GITHUB_WORKSPACE/artifact_out/" \;
           ls -lh "$GITHUB_WORKSPACE/artifact_out"
 
