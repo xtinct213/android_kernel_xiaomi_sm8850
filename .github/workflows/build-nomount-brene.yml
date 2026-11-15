@@ -35,7 +35,7 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/YuzakiKokuban/Kokuban_Kernel_CI_Center.git ci_center
 
-          # 1. Replace Kokuban's default version tag with XtinctionKernel@bakasu (keeps uname -r under 64 chars)
+          # 1. Replace Kokuban's default version tag inside ci_center with XtinctionKernel@bakasu (keeps uname -r under 64 chars)
           find ci_center -type f \( -name "*.json" -o -name "*.rs" -o -name "*.toml" -o -name "*.sh" \) \
             -exec sed -i 's/Kokuban-SilverWolf-BakaSU/XtinctionKernel@bakasu/g; s/Kokuban-SilverWolf/XtinctionKernel@bakasu/g' {} + || true
 
@@ -50,10 +50,7 @@ jobs:
           git config user.name "Builder"
           git commit -am "base: fs/Makefile after susfs"
 
-          # 3. Also replace any hardcoded Kokuban-SilverWolf string inside the kernel tree if present
-          grep -rl "Kokuban-SilverWolf" . --exclude-dir=.git | xargs -r sed -i 's/Kokuban-SilverWolf-BakaSU/XtinctionKernel@bakasu/g; s/Kokuban-SilverWolf/XtinctionKernel@bakasu/g' || true
-
-          # 4. Integrate NoMount and hook KernelSU Makefile to pull latest BakaSU main + stamp XtinctionKernel@bakasu
+          # 3. Integrate NoMount and hook KernelSU Makefile to pull latest BakaSU main + stamp XtinctionKernel@bakasu
           curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash
           rm -f fs/nomount
           cp -r NoMount/kernel/src fs/nomount
@@ -72,7 +69,7 @@ jobs:
           fi)
           EOF
 
-          # 5. Append NoMount and all 10 SuSFS flags for BRENE to gki_defconfig (without duplicate CONFIG_LOCALVERSION)
+          # 4. Append NoMount and all 10 SuSFS flags for BRENE to gki_defconfig
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
@@ -89,8 +86,8 @@ jobs:
           CONFIG_NOMOUNT=y
           EOF
 
-          # 6. Append our patch to mi17_sm8850.patch
-          git add -A
+          # 5. Stage ONLY fs/ and gki_defconfig so .github/workflows is never included in the patch
+          git add fs arch/arm64/configs/gki_defconfig
           echo "" >> ../ci_center/configs/susfs/mi17_sm8850.patch
           git diff --cached HEAD >> ../ci_center/configs/susfs/mi17_sm8850.patch
           cd ..
