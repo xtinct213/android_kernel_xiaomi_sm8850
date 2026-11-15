@@ -53,17 +53,41 @@ jobs:
             -e 's/--dirty//g' \
             -e 's/-dirty//g' {} + || true
 
-          # 3. Sync any new kernel patch hunks from SuSFS v2.4.0 into mi17_sm8850.patch
+          cd kernel_prep
+          # 3. Save clean pre-patch copies of non-hook files, then apply original mi17_sm8850.patch (c6788e2 baseline)
+          mkdir -p /tmp/orig_files /tmp/c6788e2_files
+          for f in fs/Makefile fs/namei.c fs/readdir.c security/selinux/hooks.c security/selinux/ss/services.c; do
+            mkdir -p "/tmp/orig_files/$(dirname "$f")" "/tmp/c6788e2_files/$(dirname "$f")"
+            cp "$f" "/tmp/orig_files/$f"
+          done
+
+          patch -p1 --forward < ../ci_center/configs/susfs/mi17_sm8850.patch || true
+
+          for f in fs/Makefile fs/namei.c fs/readdir.c security/selinux/hooks.c security/selinux/ss/services.c; do
+            cp "$f" "/tmp/c6788e2_files/$f"
+          done
+
+          # Reset working tree and commit the c6788e2-patched state of those 5 files as our baseline
+          git reset --hard HEAD
+          git clean -fd
+          for f in fs/Makefile fs/namei.c fs/readdir.c security/selinux/hooks.c security/selinux/ss/services.c; do
+            cp "/tmp/c6788e2_files/$f" "$f"
+          done
+          git config user.email "builder@localhost"
+          git config user.name "Builder"
+          git commit --allow-empty -am "base: files after susfs c6788e2"
+
+          # 4. Upgrade changed SuSFS files from c6788e2 to latest v2.4.0 so git diff captures the exact incremental delta
           python3 - << 'PYEOF'
-          import re, subprocess
+          import re, subprocess, shutil
 
           old_sha = "c6788e2a21dc717beb7dd3a36b729b58bc909927"
           patch_rel = "kernel_patches/50_add_susfs_in_gki-android16-6.12.patch"
 
-          old_p = subprocess.check_output(["git", "-C", "susfs_latest", "show", f"{old_sha}:{patch_rel}"], text=True, errors="replace")
-          new_p = subprocess.check_output(["git", "-C", "susfs_latest", "show", f"HEAD:{patch_rel}"], text=True, errors="replace")
+          old_p = subprocess.check_output(["git", "-C", "../susfs_latest", "show", f"{old_sha}:{patch_rel}"], text=True, errors="replace")
+          new_p = subprocess.check_output(["git", "-C", "../susfs_latest", "show", f"HEAD:{patch_rel}"], text=True, errors="replace")
 
-          def split_diffs(text):
+          def split_git_diffs(text):
               parts = re.split(r'(?=^diff --git )', text, flags=re.MULTILINE)
               out = {}
               for part in parts:
@@ -72,37 +96,21 @@ jobs:
                       out[m.group(1).strip()] = part
               return out
 
-          old_map = split_diffs(old_p)
-          new_map = split_diffs(new_p)
+          old_map = split_git_diffs(old_p)
+          new_map = split_git_diffs(new_p)
+          tracked = {"fs/namei.c", "fs/readdir.c", "security/selinux/hooks.c", "security/selinux/ss/services.c"}
 
-          with open("ci_center/configs/susfs/mi17_sm8850.patch", "r", encoding="utf-8", errors="replace") as f:
-              mi17_text = f.read()
-          mi17_map = split_diffs(mi17_text)
-
-          hook_files = {"fs/exec.c", "fs/open.c", "fs/stat.c", "kernel/reboot.c", "kernel/sys.c", "fs/read_write.c"}
-
-          for fname, new_diff in new_map.items():
-              if old_map.get(fname) != new_diff and fname not in hook_files:
-                  res = subprocess.run(["patch", "-d", "kernel_prep", "-p1", "--dry-run", "--forward"], input=new_diff.encode(), capture_output=True)
+          for fname in tracked:
+              if fname in new_map and old_map.get(fname) != new_map[fname]:
+                  shutil.copyfile(f"/tmp/orig_files/{fname}", fname)
+                  res = subprocess.run(["patch", "-p1", "--forward"], input=new_map[fname].encode(), capture_output=True)
                   if res.returncode == 0:
-                      print(f"Updated {fname} in mi17_sm8850.patch with SuSFS v2.4.0 changes")
-                      mi17_map[fname] = new_diff
-
-          with open("ci_center/configs/susfs/mi17_sm8850.patch", "w", encoding="utf-8") as f:
-              f.write("".join(mi17_map.values()))
+                      print(f"Upgraded {fname} to SuSFS v2.4.0")
+                  else:
+                      shutil.copyfile(f"/tmp/c6788e2_files/{fname}", fname)
           PYEOF
-          rm -rf susfs_latest
-
-          cd kernel_prep
-          # 4. Stage fs/Makefile with SuSFS applied so our patch has exact context
-          patch -p1 --forward < ../ci_center/configs/susfs/mi17_sm8850.patch || true
-          cp fs/Makefile /tmp/Makefile.susfs
-          git reset --hard HEAD
-          git clean -fd
-          cp /tmp/Makefile.susfs fs/Makefile
-          git config user.email "builder@localhost"
-          git config user.name "Builder"
-          git commit -am "base: fs/Makefile after susfs"
+          find . \( -name "*.rej" -o -name "*.orig" \) -delete
+          rm -rf ../susfs_latest
 
           # 5. Integrate NoMount
           curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash
@@ -158,8 +166,8 @@ jobs:
           CONFIG_NOMOUNT=y
           EOF
 
-          # 9. Stage ONLY kernel files so .github/workflows is never included in the patch
-          git add fs arch/arm64/Makefile arch/arm64/configs/gki_defconfig
+          # 9. Stage ONLY kernel files and append (>>) the incremental delta onto the original mi17_sm8850.patch
+          git add fs security arch/arm64/Makefile arch/arm64/configs/gki_defconfig
           echo "" >> ../ci_center/configs/susfs/mi17_sm8850.patch
           git diff --cached HEAD >> ../ci_center/configs/susfs/mi17_sm8850.patch
           cd ..
@@ -207,4 +215,12 @@ jobs:
             fi
           fi
 
-          ls -
+          ls -lh "$GITHUB_WORKSPACE/artifact_out"
+
+      - name: Upload Kernel ZIP & BakaSU Manager Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: XtinctionKernel-BakaSU-Bundle
+          path: |
+            artifact_out/*.zip
+            artifact_out/*.apk
