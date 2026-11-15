@@ -1,4 +1,4 @@
-name: Build SM8850 (Latest BakaSU + SuSFS for BRENE + NoMount)
+name: Build SM8850 (Latest BakaSU + SuSFS for BRENE + NoMount + Manager APK)
 
 on:
   workflow_dispatch:
@@ -108,25 +108,44 @@ jobs:
             --no-hybridmount \
             --local-root "$GITHUB_WORKSPACE/kokuban-work"
 
-      - name: Collect Flashable AnyKernel3 ZIP with Matching BakaSU Version Number
+      - name: Collect Kernel ZIP & Matching BakaSU Manager APK
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifact_out"
           KSU_DIR=$(find "$GITHUB_WORKSPACE/kokuban-work" -type d -name "KernelSU" | head -n 1)
           if [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR/.git" ]; then
             cd "$KSU_DIR"
-            # Calculate the exact KSU_VERSION formula used by KernelSU/BakaSU
             COUNT=$(git rev-list --count HEAD)
             KSU_VER=$((30000 + COUNT))
             echo "Compiled with latest BakaSU version code: $KSU_VER"
           else
             KSU_VER="latest"
           fi
+
+          # 1. Copy compiled AnyKernel3 ZIP with the exact BakaSU version number in the filename
           find "$GITHUB_WORKSPACE/kokuban-work/artifacts" -type f -name "*.zip" \
             -exec cp -v {} "$GITHUB_WORKSPACE/artifact_out/XtinctionKernel-BakaSU-${KSU_VER}-SuSFS-NoMount.zip" \;
+
+          # 2. Fetch the matching latest BakaSU Manager APK from nightly.link (with GitHub Releases fallback)
+          mkdir -p /tmp/bakasu_apk
+          if curl -fLSs "https://nightly.link/Baka-SU/BakaSU/workflows/build-manager/main/Manager-release.zip" -o /tmp/bakasu_apk/Manager-release.zip; then
+            unzip -o /tmp/bakasu_apk/Manager-release.zip -d /tmp/bakasu_apk/
+            APK_FILE=$(find /tmp/bakasu_apk -type f -name "*.apk" | head -n 1)
+            if [ -n "$APK_FILE" ]; then
+              cp -v "$APK_FILE" "$GITHUB_WORKSPACE/artifact_out/BakaSU-Manager-${KSU_VER}.apk"
+            fi
+          else
+            APK_URL=$(curl -s https://api.github.com/repos/Baka-SU/BakaSU/releases | jq -r '.[0].assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+            if [ -n "$APK_URL" ] && [ "$APK_URL" != "null" ]; then
+              curl -LSs "$APK_URL" -o "$GITHUB_WORKSPACE/artifact_out/BakaSU-Manager-${KSU_VER}.apk"
+            fi
+          fi
+
           ls -lh "$GITHUB_WORKSPACE/artifact_out"
 
-      - name: Upload Compiled Kernel Artifact
+      - name: Upload Kernel ZIP & BakaSU Manager Bundle
         uses: actions/upload-artifact@v4
         with:
-          name: XtinctionKernel-BakaSU-Latest-SuSFS-NoMount
-          path: artifact_out/*.zip
+          name: XtinctionKernel-BakaSU-Bundle
+          path: |
+            artifact_out/*.zip
+            artifact_out/*.apk
