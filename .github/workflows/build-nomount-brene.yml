@@ -1,7 +1,11 @@
-name: Build SM8850 (BakaSU + SuSFS for BRENE + NoMount)
+name: Build SM8850 (Latest BakaSU + SuSFS for BRENE + NoMount)
 
 on:
   workflow_dispatch:
+
+env:
+  KBUILD_BUILD_USER: "XtinctionKernel"
+  KBUILD_BUILD_HOST: "bakasu"
 
 jobs:
   build-kernel:
@@ -9,7 +13,7 @@ jobs:
     steps:
       - name: Free up runner disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
 
       - name: Install build dependencies
@@ -27,12 +31,15 @@ jobs:
           fetch-depth: 1
           path: kernel_prep
 
-      - name: Clone Kokuban_Kernel_CI_Center & Append NoMount + BRENE Patch
+      - name: Clone Kokuban_Kernel_CI_Center & Configure Dynamic Latest BakaSU + XtinctionKernel@bakasu
         run: |
           git clone --depth=1 https://github.com/YuzakiKokuban/Kokuban_Kernel_CI_Center.git ci_center
 
+          # 1. Preserve our custom LOCALVERSION in kokuban_ci_core
+          sed -i 's/LOCALVERSION=/KBUILD_BUILD_USER=XtinctionKernel/g' ci_center/ci_core_rs/src/*.rs || true
+
           cd kernel_prep
-          # 1. Stage fs/Makefile with the SuSFS hunk applied so NoMount's Makefile hunk has exact context
+          # 2. Stage fs/Makefile with SuSFS applied so our patch has exact context
           patch -p1 --forward < ../ci_center/configs/susfs/mi17_sm8850.patch || true
           cp fs/Makefile /tmp/Makefile.susfs
           git reset --hard HEAD
@@ -42,15 +49,34 @@ jobs:
           git config user.name "Builder"
           git commit -am "base: fs/Makefile after susfs"
 
-          # 2. Run NoMount setup.sh, then replace the symlink with the real C source files and remove the nested git repo
+          # 3. Force kernel version string (uname -r) to end with -XtinctionKernel@bakasu
+          if [ -f "scripts/setlocalversion" ]; then
+            sed -i 's/echo "\$res"/echo "\${res}-XtinctionKernel@bakasu"/g' scripts/setlocalversion || true
+          fi
+
+          # 4. Integrate NoMount and hook KernelSU Makefile to pull latest BakaSU main + stamp XtinctionKernel@bakasu
           curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash
           rm -f fs/nomount
           cp -r NoMount/kernel/src fs/nomount
           rm -rf NoMount
-          echo "ccflags-y += -Wno-error" >> fs/nomount/Makefile
 
-          # 3. Append NoMount and all 10 SuSFS flags for BRENE to gki_defconfig
+          cat << 'EOF' >> fs/nomount/Makefile
+          ccflags-y += -Wno-error
+          # Ensure KernelSU is on latest origin/main with full history so KSU_VERSION commit count is exact,
+          # then append XtinctionKernel@bakasu while keeping the dynamic $(KSU_VERSION) number intact
+          _BAKASU_LATEST := $(shell if [ -d "$(srctree)/KernelSU" ]; then \
+            cd "$(srctree)/KernelSU" && \
+            git fetch --unshallow origin main >/dev/null 2>&1 || git fetch origin main >/dev/null 2>&1; \
+            git checkout -f FETCH_HEAD >/dev/null 2>&1 || true; \
+            grep -q "XtinctionKernel@bakasu" kernel/Makefile || \
+            printf '\nKSU_VERSION_FULL := v4.2.0-$$(KSU_VERSION)-XtinctionKernel@bakasu\nccflags-y += -UKSU_VERSION_FULL -DKSU_VERSION_FULL=\\"$$(KSU_VERSION_FULL)\\"\n' >> kernel/Makefile; \
+          fi)
+          EOF
+
+          # 5. Append NoMount, LOCALVERSION, and all 10 SuSFS flags for BRENE to gki_defconfig
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
+          CONFIG_LOCALVERSION="-XtinctionKernel@bakasu"
+          CONFIG_LOCALVERSION_AUTO=n
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -66,14 +92,14 @@ jobs:
           CONFIG_NOMOUNT=y
           EOF
 
-          # 4. Append (>>) our NoMount + defconfig diff to the end of the original mi17_sm8850.patch
+          # 6. Append our patch to mi17_sm8850.patch
           git add -A
           echo "" >> ../ci_center/configs/susfs/mi17_sm8850.patch
           git diff --cached HEAD >> ../ci_center/configs/susfs/mi17_sm8850.patch
           cd ..
           rm -rf kernel_prep
 
-      - name: Build Kernel via Kokuban CI Center (SuSFS ON, Hybrid Mount OFF)
+      - name: Build Kernel via Kokuban CI Center
         working-directory: ci_center
         run: |
           chmod +x ./kokuban
@@ -82,15 +108,25 @@ jobs:
             --no-hybridmount \
             --local-root "$GITHUB_WORKSPACE/kokuban-work"
 
-      - name: Collect Flashable AnyKernel3 ZIP
+      - name: Collect Flashable AnyKernel3 ZIP with Matching BakaSU Version Number
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifact_out"
+          KSU_DIR=$(find "$GITHUB_WORKSPACE/kokuban-work" -type d -name "KernelSU" | head -n 1)
+          if [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR/.git" ]; then
+            cd "$KSU_DIR"
+            # Calculate the exact KSU_VERSION formula used by KernelSU/BakaSU
+            COUNT=$(git rev-list --count HEAD)
+            KSU_VER=$((30000 + COUNT))
+            echo "Compiled with latest BakaSU version code: $KSU_VER"
+          else
+            KSU_VER="latest"
+          fi
           find "$GITHUB_WORKSPACE/kokuban-work/artifacts" -type f -name "*.zip" \
-            -exec cp -v {} "$GITHUB_WORKSPACE/artifact_out/" \;
+            -exec cp -v {} "$GITHUB_WORKSPACE/artifact_out/XtinctionKernel-BakaSU-${KSU_VER}-SuSFS-NoMount.zip" \;
           ls -lh "$GITHUB_WORKSPACE/artifact_out"
 
       - name: Upload Compiled Kernel Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Mi17-Kokuban-BakaSU-SuSFS-NoMount
+          name: XtinctionKernel-BakaSU-Latest-SuSFS-NoMount
           path: artifact_out/*.zip
