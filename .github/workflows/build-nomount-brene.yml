@@ -31,7 +31,7 @@ jobs:
           fetch-depth: 1
           path: kernel_prep
 
-      - name: Clone CI Center & Upgrade to SuSFS v2.4.0 + NoMount + XtinctionKernel@bakasu
+      - name: Clone CI Center & Upgrade to SuSFS v2.4.0 + NoMount + XtinctionKernel
         run: |
           git clone --depth=1 https://github.com/YuzakiKokuban/Kokuban_Kernel_CI_Center.git ci_center
 
@@ -42,16 +42,13 @@ jobs:
           echo "Upgrading SuSFS from c6788e2 to latest v2.4.0 commit: ${SUSFS_V24_SHA}"
           cd ..
 
-          # 2. Update pinned SuSFS revision in ci_center to latest v2.4.0 SHA & set XtinctionKernel version strings
+          # 2. Update ONLY the SuSFS commit hash and branding strings in ci_center
+          #    (Do NOT strip -dirty here so kokuban_ci_core's setlocalversion patcher stays intact)
           find ci_center -type f \( -name "*.json" -o -name "*.rs" -o -name "*.toml" -o -name "*.sh" \) -exec sed -i \
             -e "s/c6788e2a21dc717beb7dd3a36b729b58bc909927/${SUSFS_V24_SHA}/g" \
-            -e 's/Kokuban-SilverWolf-BakaSU/XtinctionKernel@bakasu/g' \
-            -e 's/-BakaSU/@bakasu/g' \
             -e 's/Kokuban-SilverWolf/XtinctionKernel/g' \
-            -e 's/KokubanKernel@BakaSU/XtinctionKernel@BakaSU/g' \
-            -e 's/KokubanKernel/XtinctionKernel/g' \
-            -e 's/--dirty//g' \
-            -e 's/-dirty//g' {} + || true
+            -e 's/KokubanKernel@BakaSU/XtinctionKernel/g' \
+            -e 's/KokubanKernel/XtinctionKernel/g' {} + || true
 
           # 3. Update mi17_sm8850.patch IN-PLACE for SuSFS v2.4.0 (splitting by '^--- a/' so all 27 files are kept)
           python3 - << 'PYEOF'
@@ -131,18 +128,18 @@ jobs:
           # 6. Hook arch/arm64/Makefile to enable KSU_SUSFS_PRIORITY_UID_FILTER in KernelSU & strip -dirty / KokubanKernel
           cat << 'EOF' >> arch/arm64/Makefile
 
-          # Sync BakaSU with SuSFS v2.4.0 Priority UID Filter and clean version strings
-          _SYNC_BAKASU_V24 := $(shell if [ -d "$(srctree)/KernelSU" ] && [ ! -f "$(srctree)/KernelSU/.v24_synced" ]; then \
+          # Sync BakaSU with SuSFS v2.4.0 Priority UID Filter and clean KernelSU driver version string
+          _SYNC_BAKASU_V24 := $(shell if [ -d "$(srctree)/KernelSU" ]; then \
             find "$(srctree)/KernelSU" -maxdepth 3 -type f \( -name "Makefile" -o -name "Kbuild" \) -exec sed -i \
               -e 's/--dirty//g' \
               -e 's/-dirty//g' \
+              -e 's/KokubanKernel@BakaSU/XtinctionKernel/g' \
               -e 's/KokubanKernel/XtinctionKernel/g' {} + 2>/dev/null || true; \
             for mk in "$(srctree)/KernelSU/kernel/Makefile" "$(srctree)/KernelSU/kernel/Kbuild"; do \
-              if [ -f "$$mk" ]; then \
+              if [ -f "$$mk" ] && ! grep -q "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER" "$$mk"; then \
                 printf '\nccflags-y += -DCONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=1\n' >> "$$mk"; \
               fi; \
             done; \
-            touch "$(srctree)/KernelSU/.v24_synced"; \
           fi)
           EOF
 
