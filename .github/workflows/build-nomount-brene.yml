@@ -35,8 +35,9 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/YuzakiKokuban/Kokuban_Kernel_CI_Center.git ci_center
 
-          # 1. Preserve our custom LOCALVERSION in kokuban_ci_core
-          sed -i 's/LOCALVERSION=/KBUILD_BUILD_USER=XtinctionKernel/g' ci_center/ci_core_rs/src/*.rs || true
+          # 1. Replace Kokuban's default version tag with XtinctionKernel@bakasu (keeps uname -r under 64 chars)
+          find ci_center -type f \( -name "*.json" -o -name "*.rs" -o -name "*.toml" -o -name "*.sh" \) \
+            -exec sed -i 's/Kokuban-SilverWolf-BakaSU/XtinctionKernel@bakasu/g; s/Kokuban-SilverWolf/XtinctionKernel@bakasu/g' {} + || true
 
           cd kernel_prep
           # 2. Stage fs/Makefile with SuSFS applied so our patch has exact context
@@ -49,10 +50,8 @@ jobs:
           git config user.name "Builder"
           git commit -am "base: fs/Makefile after susfs"
 
-          # 3. Force kernel version string (uname -r) to end with -XtinctionKernel@bakasu
-          if [ -f "scripts/setlocalversion" ]; then
-            sed -i 's/echo "\$res"/echo "\${res}-XtinctionKernel@bakasu"/g' scripts/setlocalversion || true
-          fi
+          # 3. Also replace any hardcoded Kokuban-SilverWolf string inside the kernel tree if present
+          grep -rl "Kokuban-SilverWolf" . --exclude-dir=.git | xargs -r sed -i 's/Kokuban-SilverWolf-BakaSU/XtinctionKernel@bakasu/g; s/Kokuban-SilverWolf/XtinctionKernel@bakasu/g' || true
 
           # 4. Integrate NoMount and hook KernelSU Makefile to pull latest BakaSU main + stamp XtinctionKernel@bakasu
           curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash
@@ -73,10 +72,8 @@ jobs:
           fi)
           EOF
 
-          # 5. Append NoMount, LOCALVERSION, and all 10 SuSFS flags for BRENE to gki_defconfig
+          # 5. Append NoMount and all 10 SuSFS flags for BRENE to gki_defconfig (without duplicate CONFIG_LOCALVERSION)
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
-          CONFIG_LOCALVERSION="-XtinctionKernel@bakasu"
-          CONFIG_LOCALVERSION_AUTO=n
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
