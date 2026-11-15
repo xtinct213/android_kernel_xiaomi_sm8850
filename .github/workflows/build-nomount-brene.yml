@@ -1,4 +1,4 @@
-name: Build SM8850 (Latest BakaSU + SuSFS for BRENE + NoMount + Manager APK)
+name: Build SM8850 (Latest BakaSU + SuSFS v2.4.0 + BRENE + NoMount + Manager APK)
 
 on:
   workflow_dispatch:
@@ -31,22 +31,70 @@ jobs:
           fetch-depth: 1
           path: kernel_prep
 
-      - name: Clone Kokuban_Kernel_CI_Center & Customize Version Strings
+      - name: Clone CI Center & Upgrade to SuSFS v2.4.0 + NoMount + XtinctionKernel@bakasu
         run: |
           git clone --depth=1 https://github.com/YuzakiKokuban/Kokuban_Kernel_CI_Center.git ci_center
 
-          # 1. Cleanly replace Kokuban strings in ci_center so:
-          #    - Kernel Version becomes: 6.12.69-android16-XtinctionKernel@bakasu-g... (no duplicate -BakaSU)
-          #    - Driver Version replaces KokubanKernel with XtinctionKernel
+          # 1. Fetch latest SuSFS v2.4.0 commit from simonpunk/susfs4ksu (gki-android16-6.12)
+          git clone -b gki-android16-6.12 https://gitlab.com/simonpunk/susfs4ksu.git susfs_latest
+          cd susfs_latest
+          SUSFS_V24_SHA=$(git rev-parse HEAD)
+          echo "Upgrading SuSFS from c6788e2 to latest v2.4.0 commit: ${SUSFS_V24_SHA}"
+          cd ..
+
+          # 2. Update pinned SuSFS revision in ci_center to latest v2.4.0 SHA & set XtinctionKernel version strings
           find ci_center -type f \( -name "*.json" -o -name "*.rs" -o -name "*.toml" -o -name "*.sh" \) -exec sed -i \
+            -e "s/c6788e2a21dc717beb7dd3a36b729b58bc909927/${SUSFS_V24_SHA}/g" \
             -e 's/Kokuban-SilverWolf-BakaSU/XtinctionKernel@bakasu/g' \
             -e 's/-BakaSU/@bakasu/g' \
             -e 's/Kokuban-SilverWolf/XtinctionKernel/g' \
             -e 's/KokubanKernel@BakaSU/XtinctionKernel@BakaSU/g' \
-            -e 's/KokubanKernel/XtinctionKernel/g' {} + || true
+            -e 's/KokubanKernel/XtinctionKernel/g' \
+            -e 's/--dirty//g' \
+            -e 's/-dirty//g' {} + || true
+
+          # 3. Sync any new kernel patch hunks from SuSFS v2.4.0 into mi17_sm8850.patch
+          python3 - << 'PYEOF'
+          import re, subprocess
+
+          old_sha = "c6788e2a21dc717beb7dd3a36b729b58bc909927"
+          patch_rel = "kernel_patches/50_add_susfs_in_gki-android16-6.12.patch"
+
+          old_p = subprocess.check_output(["git", "-C", "susfs_latest", "show", f"{old_sha}:{patch_rel}"], text=True, errors="replace")
+          new_p = subprocess.check_output(["git", "-C", "susfs_latest", "show", f"HEAD:{patch_rel}"], text=True, errors="replace")
+
+          def split_diffs(text):
+              parts = re.split(r'(?=^diff --git )', text, flags=re.MULTILINE)
+              out = {}
+              for part in parts:
+                  m = re.search(r'^diff --git a/(.*?) b/(.*?)$', part, re.MULTILINE)
+                  if m:
+                      out[m.group(1).strip()] = part
+              return out
+
+          old_map = split_diffs(old_p)
+          new_map = split_diffs(new_p)
+
+          with open("ci_center/configs/susfs/mi17_sm8850.patch", "r", encoding="utf-8", errors="replace") as f:
+              mi17_text = f.read()
+          mi17_map = split_diffs(mi17_text)
+
+          hook_files = {"fs/exec.c", "fs/open.c", "fs/stat.c", "kernel/reboot.c", "kernel/sys.c", "fs/read_write.c"}
+
+          for fname, new_diff in new_map.items():
+              if old_map.get(fname) != new_diff and fname not in hook_files:
+                  res = subprocess.run(["patch", "-d", "kernel_prep", "-p1", "--dry-run", "--forward"], input=new_diff.encode(), capture_output=True)
+                  if res.returncode == 0:
+                      print(f"Updated {fname} in mi17_sm8850.patch with SuSFS v2.4.0 changes")
+                      mi17_map[fname] = new_diff
+
+          with open("ci_center/configs/susfs/mi17_sm8850.patch", "w", encoding="utf-8") as f:
+              f.write("".join(mi17_map.values()))
+          PYEOF
+          rm -rf susfs_latest
 
           cd kernel_prep
-          # 2. Stage fs/Makefile with SuSFS applied so our patch has exact context
+          # 4. Stage fs/Makefile with SuSFS applied so our patch has exact context
           patch -p1 --forward < ../ci_center/configs/susfs/mi17_sm8850.patch || true
           cp fs/Makefile /tmp/Makefile.susfs
           git reset --hard HEAD
@@ -56,30 +104,50 @@ jobs:
           git config user.name "Builder"
           git commit -am "base: fs/Makefile after susfs"
 
-          # 3. Integrate NoMount and strip '-dirty' / 'KokubanKernel' from KernelSU/kernel/Kbuild & Makefile during build
+          # 5. Integrate NoMount
           curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash
           rm -f fs/nomount
           cp -r NoMount/kernel/src fs/nomount
           rm -rf NoMount
 
-          cat << 'EOF' >> fs/nomount/Makefile
-          ccflags-y += -Wno-error
-          # Strip --dirty and ensure KokubanKernel is replaced with XtinctionKernel inside KernelSU before Kbuild runs
-          _CLEAN_KSU_VER := $(shell if [ -d "$(srctree)/KernelSU" ]; then \
+          # 6. Declare KSU_SUSFS_PRIORITY_UID_FILTER in Kconfig so Kbuild never drops it during make gki_defconfig
+          cat << 'EOF' >> fs/nomount/Kconfig
+
+          config KSU_SUSFS_PRIORITY_UID_FILTER
+          	bool "SUSFS Priority UID Filter (v2.4.0+)"
+          	default y
+          EOF
+
+          # 7. Hook arch/arm64/Makefile (runs before any compilation) to sync BakaSU for SuSFS v2.4.0 & clean version strings
+          cat << 'EOF' >> arch/arm64/Makefile
+
+          # Sync BakaSU with SuSFS v2.4.0 Priority UID hooks (PR #649) and strip -dirty / KokubanKernel
+          _SYNC_BAKASU_V24 := $(shell if [ -d "$(srctree)/KernelSU" ] && [ ! -f "$(srctree)/KernelSU/.v24_synced" ]; then \
+            cd "$(srctree)/KernelSU" && \
+            if ! grep -rq "KSU_SUSFS_PRIORITY_UID_FILTER" kernel/ 2>/dev/null; then \
+              curl -fLSs "https://github.com/Baka-SU/BakaSU/pull/649.patch" -o /tmp/bakasu_649.patch && \
+              (git apply /tmp/bakasu_649.patch >/dev/null 2>&1 || git apply --3way /tmp/bakasu_649.patch >/dev/null 2>&1 || patch -p1 -N < /tmp/bakasu_649.patch >/dev/null 2>&1 || true); \
+              find . \( -name "*.rej" -o -name "*.orig" \) -delete; \
+            fi; \
             find "$(srctree)/KernelSU" -maxdepth 3 -type f \( -name "Makefile" -o -name "Kbuild" \) -exec sed -i \
               -e 's/--dirty//g' \
               -e 's/-dirty//g' \
               -e 's/KokubanKernel/XtinctionKernel/g' {} + 2>/dev/null || true; \
+            printf '\nccflags-y += -DCONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=1\n' >> kernel/Makefile; \
+            touch "$(srctree)/KernelSU/.v24_synced"; \
           fi)
           EOF
 
-          # 4. Append NoMount and all 10 SuSFS flags for BRENE to gki_defconfig
+          echo "ccflags-y += -Wno-error" >> fs/nomount/Makefile
+
+          # 8. Append NoMount and all SuSFS v2.4.0 flags for BRENE (10/10) to gki_defconfig
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
           CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
           CONFIG_KSU_SUSFS_SPOOF_UNAME=y
           CONFIG_KSU_SUSFS_ENABLE_LOG=y
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
@@ -90,8 +158,8 @@ jobs:
           CONFIG_NOMOUNT=y
           EOF
 
-          # 5. Stage ONLY fs/ and gki_defconfig so .github/workflows is never included in the patch
-          git add fs arch/arm64/configs/gki_defconfig
+          # 9. Stage ONLY kernel files so .github/workflows is never included in the patch
+          git add fs arch/arm64/Makefile arch/arm64/configs/gki_defconfig
           echo "" >> ../ci_center/configs/susfs/mi17_sm8850.patch
           git diff --cached HEAD >> ../ci_center/configs/susfs/mi17_sm8850.patch
           cd ..
@@ -121,7 +189,7 @@ jobs:
 
           # 1. Copy compiled AnyKernel3 ZIP with the BakaSU version number in the filename
           find "$GITHUB_WORKSPACE/kokuban-work/artifacts" -type f -name "*.zip" \
-            -exec cp -v {} "$GITHUB_WORKSPACE/artifact_out/XtinctionKernel-BakaSU-${KSU_VER}-SuSFS-NoMount.zip" \;
+            -exec cp -v {} "$GITHUB_WORKSPACE/artifact_out/XtinctionKernel-BakaSU-${KSU_VER}-SuSFS-v2.4.0-NoMount.zip" \;
 
           # 2. Fetch the matching arm64-v8a BakaSU Manager APK from nightly.link (with GitHub Releases fallback)
           mkdir -p /tmp/bakasu_apk
@@ -139,12 +207,4 @@ jobs:
             fi
           fi
 
-          ls -lh "$GITHUB_WORKSPACE/artifact_out"
-
-      - name: Upload Kernel ZIP & BakaSU Manager Bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: XtinctionKernel-BakaSU-Bundle
-          path: |
-            artifact_out/*.zip
-            artifact_out/*.apk
+          ls -
